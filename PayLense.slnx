@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="src/PayLense.API/PayLense.API.csproj" Id="a76a3d57-7145-42df-8c65-4b14b198f621" />
+  <Project Path="src/PayLense.Application/PayLense.Application.csproj" Id="a19c51e6-e9ea-46d2-9760-931d86ed40ae" />
+  <Project Path="src/PayLense.Domain/PayLense.Domain.csproj" Id="3e68f214-beff-4c6f-ab20-deb108d898db" />
+  <Project Path="src/PayLense.Infrastructure/PayLense.Infrastructure.csproj" Id="cd29578d-22e2-4943-8cc8-5c5b1dc3c7f7" />
+  <Project Path="tests/PayLense.Domain.Tests/PayLense.Domain.Tests.csproj" Id="6ed25e58-0c02-495d-a140-8fe3f4774d42" />
+</Solution>
