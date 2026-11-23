@@ -63,20 +63,83 @@ public class AuthService : IAuthService
         ApplicationUser user;
         await using (var tx = await _db.Database.BeginTransactionAsync())
         {
-            user = new ApplicationUser { UserName = username, Email = email, PhoneNumber = phone };
+            user = new ApplicationUser
+            {
+                UserName = username,
+                Email = email,
+                PhoneNumber = phone,
+                IsActive = true,
+                IsDeleted = false,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
 
             var result = await _users.CreateAsync(user, r.Password);
             if (!result.Succeeded) throw IdentityFailure(result);
 
+            var account = new FinancialAccount
+            {
+                UserId = user.Id,
+                AccountName = "Primary Account",
+                Currency = "EGP",
+                AccountStatus = "Active"
+            };
+            _db.FinancialAccounts.Add(account);
+
             _db.BankCards.Add(new BankCard
             {
                 UserId = user.Id,
+                AccountId = account.AccountId,
                 CardNumberEncrypted = _encryptor.Encrypt(cardNumber),
+                CardFingerprint = _tokens.Hash(cardNumber),
                 Last4Digits = cardNumber[^4..],
+                CardholderName = username,
                 ExpiryMonth = r.ExpiryMonth,
                 ExpiryYear = r.ExpiryYear,
+                Currency = "EGP",
+                CardStatus = "Active",
                 IsDefault = true
             });
+
+            _db.UserContactMethods.AddRange(
+                new UserContactMethod
+                {
+                    UserId = user.Id,
+                    ContactType = "Email",
+                    ContactValue = email,
+                    IsPrimary = true,
+                    IsVerified = false,
+                    IsActive = true
+                },
+                new UserContactMethod
+                {
+                    UserId = user.Id,
+                    ContactType = "Phone",
+                    ContactValue = phone,
+                    IsPrimary = true,
+                    IsVerified = false,
+                    IsActive = true
+                }
+            );
+
+            _db.AppSettings.Add(new AppSetting
+            {
+                UserId = user.Id,
+                Language = "en",
+                Theme = "System",
+                NotificationsEnabled = true
+            });
+
+            _db.NotificationPreferences.Add(new NotificationPreference
+            {
+                UserId = user.Id,
+                TransactionNotifications = true,
+                SecurityNotifications = true,
+                MarketingNotifications = false,
+                EmailNotifications = true,
+                PushNotifications = true
+            });
+
             await _db.SaveChangesAsync();
             await tx.CommitAsync();
         }
@@ -104,7 +167,18 @@ public class AuthService : IAuthService
             throw new AppException("Invalid or expired code.");
 
         user.EmailConfirmed = true;
+        user.UpdatedAt = DateTime.UtcNow;
         await _users.UpdateAsync(user);
+
+        var contact = await _db.UserContactMethods
+            .FirstOrDefaultAsync(c => c.UserId == user.Id && c.ContactType == "Email" && c.ContactValue == user.Email);
+        if (contact != null)
+        {
+            contact.IsVerified = true;
+            contact.VerifiedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync();
+        }
+
         return new MessageResponse { Message = "Email confirmed." };
     }
 
@@ -120,13 +194,23 @@ public class AuthService : IAuthService
             throw new AppException("Invalid or expired code.");
 
         user.PhoneNumberConfirmed = true;
+        user.UpdatedAt = DateTime.UtcNow;
         await _users.UpdateAsync(user);
+
+        var contact = await _db.UserContactMethods
+            .FirstOrDefaultAsync(c => c.UserId == user.Id && c.ContactType == "Phone" && c.ContactValue == user.PhoneNumber);
+        if (contact != null)
+        {
+            contact.IsVerified = true;
+            contact.VerifiedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync();
+        }
+
         return new MessageResponse { Message = "Phone number confirmed." };
     }
 
     public async Task<MessageResponse> ResendOtpAsync(ResendOtpRequest r)
     {
-        // رسالة موحدة عشان محدش يعرف مين مسجل ومين لأ
         var generic = new MessageResponse { Message = "If the account exists, a new code has been sent." };
 
         var identifier = r.Identifier.Trim();
@@ -163,6 +247,9 @@ public class AuthService : IAuthService
         var user = await FindByIdentifierAsync(r.Identifier)
             ?? throw new AppException("Invalid credentials.", 401);
 
+        if (!user.IsActive || user.IsDeleted)
+            throw new AppException("Account is inactive or deleted.", 403);
+
         if (await _users.IsLockedOutAsync(user))
             throw new AppException("Account is temporarily locked. Try again later.", 429);
 
@@ -176,7 +263,6 @@ public class AuthService : IAuthService
         if (!user.EmailConfirmed || !user.PhoneNumberConfirmed)
             throw new AppException("Please confirm your email and phone number first.", 403);
 
-        // جهاز موثوق => نتخطى الـ 2FA
         var trusted = await _db.TrustedDevices.FirstOrDefaultAsync(d =>
             d.UserId == user.Id && d.DeviceIdentifier == r.DeviceId && !d.IsRevoked);
 
@@ -213,7 +299,7 @@ public class AuthService : IAuthService
         if (r.TrustDevice)
             await TrustDeviceAsync(user.Id, r.DeviceId, r.DeviceName);
 
-        return await IssueTokensAsync(user, r.DeviceId);
+        return await IssueTokensAsync(user, r.DeviceId, twoFaVerifiedAt: DateTime.UtcNow);
     }
 
     // ------------------------------------------------------ Refresh / Logout
@@ -227,7 +313,6 @@ public class AuthService : IAuthService
 
         if (stored.DeviceId != r.DeviceId) throw invalid;
 
-        // token اتستخدم قبل كده => احتمال اتسرق، نبطّل كل tokens الجهاز ده
         if (stored.RevokedAt != null)
         {
             var siblings = await _db.RefreshTokens
@@ -252,6 +337,8 @@ public class AuthService : IAuthService
         if (stored != null && stored.RevokedAt == null)
         {
             stored.RevokedAt = DateTime.UtcNow;
+            var session = await _db.LoginSessions.FirstOrDefaultAsync(s => s.SessionTokenHash == hash && s.RevokedAt == null);
+            if (session != null) session.RevokedAt = DateTime.UtcNow;
             await _db.SaveChangesAsync();
         }
         return new MessageResponse { Message = "Logged out." };
@@ -259,11 +346,12 @@ public class AuthService : IAuthService
 
     // ----------------------------------------------------------- Helpers
     private async Task<AuthResponse> IssueTokensAsync(
-        ApplicationUser user, string deviceId, RefreshToken? replacing = null)
+        ApplicationUser user, string deviceId, RefreshToken? replacing = null, DateTime? twoFaVerifiedAt = null)
     {
         var (access, expiresAt) = _tokens.CreateAccessToken(
             user.Id, user.UserName!, user.Email!, deviceId);
         var (plain, hash) = _tokens.CreateRefreshToken();
+        var refreshExpires = DateTime.UtcNow.AddDays(_jwt.RefreshTokenDays);
 
         if (replacing != null)
         {
@@ -276,8 +364,17 @@ public class AuthService : IAuthService
             UserId = user.Id,
             TokenHash = hash,
             DeviceId = deviceId,
-            ExpiresAt = DateTime.UtcNow.AddDays(_jwt.RefreshTokenDays)
+            ExpiresAt = refreshExpires
         });
+
+        _db.LoginSessions.Add(new LoginSession
+        {
+            UserId = user.Id,
+            SessionTokenHash = hash,
+            TwoFaVerifiedAt = twoFaVerifiedAt,
+            ExpiresAt = refreshExpires
+        });
+
         await _db.SaveChangesAsync();
 
         return new AuthResponse
