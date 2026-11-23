@@ -7,6 +7,8 @@ using Microsoft.OpenApi.Models;
 using PayLense.API.Middleware;
 using PayLense.Application.Common;
 using PayLense.Infrastructure;
+using Microsoft.EntityFrameworkCore;
+using PayLense.Infrastructure.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -15,7 +17,7 @@ builder.Services
     .AddJsonOptions(o => o.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()))
     .ConfigureApiBehaviorOptions(o =>
     {
-        // نفس شكل الـ error الموحد: { message, errors }
+        
         o.InvalidModelStateResponseFactory = ctx =>
         {
             var errors = ctx.ModelState
@@ -56,7 +58,6 @@ builder.Services
 
 builder.Services.AddAuthorization();
 
-// ---------- Swagger (مع زر Authorize) ----------
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
@@ -84,6 +85,12 @@ builder.Services.AddSwaggerGen(c =>
 
 var app = builder.Build();
 
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    await db.Database.MigrateAsync();
+}
+
 app.UseMiddleware<ExceptionMiddleware>();
 
 if (app.Environment.IsDevelopment())
@@ -93,7 +100,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-app.UseAuthentication();   // لازم قبل UseAuthorization
+app.UseAuthentication();  
 app.UseAuthorization();
 app.MapControllers();
 
